@@ -26,7 +26,7 @@ from homeassistant.config_entries import ConfigFlow
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import CONF_SECRET, DOMAIN, FACTORY_DEFAULT_SECRET
+from .const import CONF_SECRET, DOMAIN, FACTORY_DEFAULT_SECRET, MANUFACTURER_ID
 from .lock_api import OnnaisAuthError, OnnaisLockClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +36,21 @@ MANUAL_SCAN_SECONDS = 25
 
 def _generate_secret() -> bytes:
     return secrets.token_hex(16).encode()
+
+
+def _is_onnais_advertisement(info: bluetooth.BluetoothServiceInfoBleak) -> bool:
+    """True if this advertisement is from an ONNAIS lock.
+
+    Matching on name alone is not reliable: that field is only populated
+    when a scanner does active scanning and merges in the device's scan
+    response (observed via BlueZ talking to the lock directly). Some
+    Bluetooth proxies relay only the bare primary advertisement packet,
+    which has no name at all -- but that packet always carries this
+    vendor's manufacturer ID, so that's checked too.
+    """
+    if info.name and info.name.startswith("MH_safe"):
+        return True
+    return MANUFACTURER_ID in info.manufacturer_data
 
 
 class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -62,8 +77,8 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
             for info in bluetooth.async_discovered_service_info(self.hass, connectable=True):
                 if info.address in current_addresses or info.address in self._discovered_devices:
                     continue
-                if info.name and info.name.startswith("MH_safe"):
-                    self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+                if _is_onnais_advertisement(info):
+                    self._discovered_devices[info.address] = f"{info.name or info.address} ({info.address})"
 
             if not self._discovered_devices:
                 self._scan_task = self.hass.async_create_task(
@@ -98,13 +113,21 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
         def _on_advertisement(info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
             if info.address in current_addresses or info.address in self._discovered_devices:
                 return
-            self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+            if not _is_onnais_advertisement(info):
+                return
+            self._discovered_devices[info.address] = f"{info.name or info.address} ({info.address})"
             found.set()
 
-        unregister = bluetooth.async_register_callback(
+        unregister_name = bluetooth.async_register_callback(
             self.hass,
             _on_advertisement,
             bluetooth.BluetoothCallbackMatcher(connectable=True, local_name="MH_safe*"),
+            bluetooth.BluetoothScanningMode.ACTIVE,
+        )
+        unregister_mfr = bluetooth.async_register_callback(
+            self.hass,
+            _on_advertisement,
+            bluetooth.BluetoothCallbackMatcher(connectable=True, manufacturer_id=MANUFACTURER_ID),
             bluetooth.BluetoothScanningMode.ACTIVE,
         )
         try:
@@ -112,7 +135,8 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
         except TimeoutError:
             pass
         finally:
-            unregister()
+            unregister_name()
+            unregister_mfr()
 
     async def async_step_no_devices_found(self, user_input: dict | None = None) -> FlowResult:
         return self.async_abort(reason="no_devices_found")

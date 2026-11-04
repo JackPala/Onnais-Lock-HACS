@@ -12,8 +12,15 @@ WRITE_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
 FACTORY_DEFAULT_SECRET = b"12345678"
 
 # The official app advertises/looks for names starting with this prefix
-# (observed on this project's hardware as "MH_safe_008").
+# (observed on this project's hardware as "MH_safe_008"). This name only
+# appears when a scanner does active scanning and merges in the scan
+# response (e.g. BlueZ talking to the lock directly) -- advertisements
+# relayed by some Bluetooth proxies carry only the bare primary packet,
+# which has no name field at all. Manufacturer ID is present in every
+# observed packet from this lock regardless of scanner, so it's the
+# primary, reliable match; local name matching is kept as a secondary path.
 LOCAL_NAME_MATCH = "MH_safe*"
+MANUFACTURER_ID = 54976  # 0xD6C0, non-SIG-registered vendor value
 
 CONF_SECRET = "secret"
 

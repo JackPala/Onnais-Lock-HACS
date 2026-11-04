@@ -8,6 +8,10 @@
     {
       "local_name": "MH_safe*",
       "connectable": true
+    },
+    {
+      "manufacturer_id": 54976,
+      "connectable": true
     }
   ],
   "documentation": "https://github.com/onnais-ha/onnais-ha",
