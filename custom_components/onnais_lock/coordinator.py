@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -15,20 +16,29 @@ from .lock_api import OnnaisAuthError, OnnaisCommandError, OnnaisLockClient
 _LOGGER = logging.getLogger(__name__)
 
 
+RECONCILE_INTERVAL = timedelta(minutes=10)
+# This is a real trade-off, not a free win: this lock can be operated by a
+# physical key or key fob that Home Assistant has no way to find out about
+# except by actually connecting and asking -- and every connection makes
+# the lock audibly chirp once. A short interval (as this used to be) means
+# frequent beeping for no practical benefit; no periodic check at all (as
+# this later became, briefly) means the displayed state can silently drift
+# wrong indefinitely after an external lock/unlock and never self-correct.
+# Ten minutes is a middle ground: state can be stale for at most that long
+# between an actual lock/unlock/service call, and the lock beeps at most
+# six times an hour instead of every 60-90 seconds.
+
+
 class OnnaisCoordinator(DataUpdateCoordinator[dict]):
     """Fetches lock/battery/buzzer/keypad-light/code status, and is also
     the shared place entities and services reach the BLE client through, so
     every connection goes through one coordinated session at a time rather
     than racing concurrent BLE connects to the same radio.
 
-    There is deliberately no periodic timer here (``update_interval`` is
-    left unset). Every operation is a fresh BLE connect (see lock_api.py),
-    and this lock audibly chirps once per successful connection -- polling
-    it on a schedule just for the sake of it would mean the lock beeping
-    at you every few minutes for no reason. Instead, a status refresh only
-    happens when something actually connects to it anyway: once at startup
-    (``async_config_entry_first_refresh``) and after every lock/unlock or
-    service call (``async_run_command`` below already requests a refresh).
+    Status also refreshes immediately after every lock/unlock or service
+    call (``async_run_command`` below), on top of the periodic interval --
+    that call doesn't need to wait for the next tick to confirm what it
+    just did.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, address: str, secret: bytes) -> None:
@@ -36,7 +46,7 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
             hass,
             _LOGGER,
             name=f"onnais_lock_{address}",
-            update_interval=None,
+            update_interval=RECONCILE_INTERVAL,
         )
         self.address = address
         self.entry = entry
@@ -70,7 +80,12 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
     async def async_run_command(self, coro_factory):
         """Run a write command then force an immediate status refresh so
         entities reflect the lock's own confirmed state, not just the
-        command's local success."""
+        command's local success. The refresh still runs even if the
+        command itself raised: a reply can get lost in transit after the
+        lock has already physically acted on it, so checking the real
+        state afterward beats trusting our own success/failure guess."""
         self._refresh_ble_device()
-        await coro_factory()
-        await self.async_request_refresh()
+        try:
+            await coro_factory()
+        finally:
+            await self.async_request_refresh()

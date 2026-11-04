@@ -11,6 +11,24 @@ development: this lock's onboard radio is a known-flaky BCM-family chip, and
 holding a long-lived GATT connection open across HA's whole polling interval
 was never validated. A future revision could move to a persistent connection
 with disconnect callbacks once that is proven reliable for a given board.
+
+Connections never use a cached GATT services table (``use_services_cache``
+is explicitly disabled below). That costs a little time on every connect,
+but it's deliberate: an interrupted connection (observed live -- e.g. someone
+using the lock's physical key or key fob at the same moment Home Assistant
+was mid-connect) can leave a *stale* cached services list behind, which then
+makes every subsequent attempt fail with ``BleakCharacteristicNotFoundError``
+forever, since the device genuinely has that characteristic but the cache
+says otherwise. For a lock reachable through an ESPHome Bluetooth proxy,
+that cache lives inside ``bleak_esphome``'s own internal store, which has no
+safe public "clear" call reachable from here -- so instead of chasing that
+cache, every connection here always does a full, honest GATT discovery.
+
+``run()`` additionally retries the whole connect/authenticate/act sequence
+on transient transport failures (a dropped link, a lost reply, etc.) instead
+of giving up on the first hiccup -- that single-attempt, no-retry design was
+the direct cause of locks getting stuck "unavailable" until Home Assistant
+was restarted.
 """
 
 from __future__ import annotations
@@ -20,6 +38,7 @@ import logging
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from .const import (
@@ -41,6 +60,14 @@ from .protocol import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Transient, transport-level failures worth retrying: a dropped/interrupted
+# link, a lost reply, a disconnect mid-operation. Deliberately does NOT
+# include OnnaisAuthError/OnnaisCommandError -- those are the lock's own
+# deterministic protocol-level rejections, and retrying one blindly would
+# just fail again (or risk tripping the lock's own rate limiting).
+TRANSIENT_ERRORS = (BleakError, TimeoutError, OSError, EOFError, BrokenPipeError, AttributeError)
+MAX_ATTEMPTS = 3
 
 
 class OnnaisAuthError(Exception):
@@ -84,13 +111,18 @@ class OnnaisLockClient:
             self._ble_device,
             self._ble_device.address,
             timeout=CONNECT_TIMEOUT,
+            max_attempts=2,
+            use_services_cache=False,
         )
-        if client.services.get_service(SERVICE_UUID) is None:
+        try:
+            if client.services.get_service(SERVICE_UUID) is None:
+                raise OnnaisCommandError("Expected ONNAIS GATT service not found on this device")
+            self._stream = FrameStream()
+            await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
+            await asyncio.sleep(0.3)
+        except Exception:
             await client.disconnect()
-            raise OnnaisCommandError("Expected ONNAIS GATT service not found on this device")
-        self._stream = FrameStream()
-        await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
-        await asyncio.sleep(0.3)
+            raise
         return client
 
     async def _authenticate(self, client: BleakClient, secret: bytes) -> None:
@@ -99,13 +131,31 @@ class OnnaisLockClient:
             raise OnnaisAuthError("Lock rejected the configured secret")
 
     async def run(self, work):
-        """Connect, authenticate with the stored secret, run work(client), disconnect."""
-        client = await self._connect()
-        try:
-            await self._authenticate(client, self._secret)
-            return await work(client)
-        finally:
-            await client.disconnect()
+        """Connect, authenticate with the stored secret, run work(client),
+        disconnect -- retrying the whole sequence on transient transport
+        failures instead of surfacing the first hiccup as a permanent
+        failure. OnnaisAuthError/OnnaisCommandError (the lock's own
+        deliberate protocol rejections) are never retried; they propagate
+        on the first attempt."""
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            client: BleakClient | None = None
+            try:
+                client = await self._connect()
+                await self._authenticate(client, self._secret)
+                return await work(client)
+            except TRANSIENT_ERRORS as error:
+                last_error = error
+                _LOGGER.debug(
+                    "ONNAIS %s: BLE attempt %d/%d failed, retrying: %s",
+                    self._ble_device.address, attempt, MAX_ATTEMPTS, error,
+                )
+            finally:
+                if client is not None:
+                    await client.disconnect()
+        raise OnnaisCommandError(
+            f"Lock unreachable after {MAX_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     # -- high level operations, each a self-contained connect/auth/act/disconnect cycle --
 
