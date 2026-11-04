@@ -6,6 +6,9 @@
         "description": "Found {name} ({address}). Put it into pairing mode now (press 3, 3, then the checkmark), then submit. A new owner secret is generated and stored only in this Home Assistant install."
       },
       "user": {
+        "title": "Add an ONNAIS lock"
+      },
+      "pick_device": {
         "title": "Add an ONNAIS lock",
         "description": "Pick a discovered lock. Leave the secret blank to pair a factory-fresh lock (you'll need to put it in pairing mode). If this lock was already claimed by this project's own tooling or a previous Home Assistant setup, paste its existing secret here instead to import it without pairing again.",
         "data": {
@@ -14,6 +17,9 @@
         }
       }
     },
+    "progress": {
+      "scan_bluetooth": "Scanning Bluetooth for an ONNAIS RV Lock for 25 seconds..."
+    },
     "error": {
       "already_bound": "This lock rejected the factory-default secret, meaning it's already bound (for example to the official ONNAIS app). Unbind it there first, or enter its existing secret manually.",
       "cannot_connect": "Could not connect to the lock. Make sure it's in pairing mode and within Bluetooth range of this Home Assistant install (or an ESPHome Bluetooth proxy).",
@@ -21,7 +27,7 @@
     },
     "abort": {
       "already_configured": "This lock is already set up.",
-      "no_devices_found": "No ONNAIS locks found. Make sure the lock is powered and within Bluetooth range.",
+      "no_devices_found": "No ONNAIS locks found after a 25-second scan. The lock advertises in short, sparse bursts rather than continuously -- try again, and make sure it's powered and within range (or within range of a Bluetooth proxy).",
       "not_visible": "That lock isn't currently visible to Home Assistant's Bluetooth stack."
     }
   },

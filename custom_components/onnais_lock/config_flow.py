@@ -44,6 +44,7 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: bluetooth.BluetoothServiceInfoBleak | None = None
         self._discovered_devices: dict[str, str] = {}
+        self._scan_task: asyncio.Task | None = None
 
     async def async_step_bluetooth(self, discovery_info: bluetooth.BluetoothServiceInfoBleak) -> FlowResult:
         await self.async_set_unique_id(discovery_info.address)
@@ -53,6 +54,70 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
         return await self.async_step_confirm()
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
+        """Entry point: show a live "Scanning..." progress step instead of
+        either an unlabelled spinner or an instant false negative, since this
+        lock's advertisements are sparse rather than continuous."""
+        if self._scan_task is None:
+            current_addresses = self._async_current_ids()
+            for info in bluetooth.async_discovered_service_info(self.hass, connectable=True):
+                if info.address in current_addresses or info.address in self._discovered_devices:
+                    continue
+                if info.name and info.name.startswith("MH_safe"):
+                    self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+
+            if not self._discovered_devices:
+                self._scan_task = self.hass.async_create_task(
+                    self._async_wait_for_advertisement(current_addresses)
+                )
+
+        if self._scan_task is not None:
+            if not self._scan_task.done():
+                return self.async_show_progress(
+                    step_id="user",
+                    progress_action="scan_bluetooth",
+                    progress_task=self._scan_task,
+                )
+            self._scan_task = None
+            if not self._discovered_devices:
+                return self.async_show_progress_done(next_step_id="no_devices_found")
+            return self.async_show_progress_done(next_step_id="pick_device")
+
+        return await self.async_step_pick_device()
+
+    async def _async_wait_for_advertisement(self, current_addresses: set[str]) -> None:
+        """Actively listen for a live advertisement for MANUAL_SCAN_SECONDS.
+
+        A snapshot of HA's cached discoveries often comes back empty even
+        when the lock is powered and in range, since it advertises in short,
+        sparse bursts rather than continuously -- so this waits for a live
+        match (or the timeout) instead of failing instantly.
+        """
+        found = asyncio.Event()
+
+        @callback
+        def _on_advertisement(info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
+            if info.address in current_addresses or info.address in self._discovered_devices:
+                return
+            self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+            found.set()
+
+        unregister = bluetooth.async_register_callback(
+            self.hass,
+            _on_advertisement,
+            bluetooth.BluetoothCallbackMatcher(connectable=True, local_name="MH_safe*"),
+            bluetooth.BluetoothScanningMode.ACTIVE,
+        )
+        try:
+            await asyncio.wait_for(found.wait(), timeout=MANUAL_SCAN_SECONDS)
+        except TimeoutError:
+            pass
+        finally:
+            unregister()
+
+    async def async_step_no_devices_found(self, user_input: dict | None = None) -> FlowResult:
+        return self.async_abort(reason="no_devices_found")
+
+    async def async_step_pick_device(self, user_input: dict | None = None) -> FlowResult:
         if user_input is not None:
             address = user_input["address"]
             await self.async_set_unique_id(address, raise_on_progress=False)
@@ -64,47 +129,8 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self._finish_with_existing_secret(address, bytes.fromhex(user_input[CONF_SECRET]))
             return await self.async_step_confirm()
 
-        current_addresses = self._async_current_ids()
-        for info in bluetooth.async_discovered_service_info(self.hass, connectable=True):
-            if info.address in current_addresses or info.address in self._discovered_devices:
-                continue
-            if info.name and info.name.startswith("MH_safe"):
-                self._discovered_devices[info.address] = f"{info.name} ({info.address})"
-
-        if not self._discovered_devices:
-            # The snapshot above only reflects advertisements HA has already
-            # cached -- this lock advertises in short, sparse bursts rather
-            # than continuously, so a cold snapshot very often comes back
-            # empty even when the lock is powered and in range. Actively
-            # listen for a live advertisement for a while before giving up,
-            # instead of failing instantly.
-            found = asyncio.Event()
-
-            @callback
-            def _on_advertisement(info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
-                if info.address in current_addresses or info.address in self._discovered_devices:
-                    return
-                self._discovered_devices[info.address] = f"{info.name} ({info.address})"
-                found.set()
-
-            unregister = bluetooth.async_register_callback(
-                self.hass,
-                _on_advertisement,
-                bluetooth.BluetoothCallbackMatcher(connectable=True, local_name="MH_safe*"),
-                bluetooth.BluetoothScanningMode.ACTIVE,
-            )
-            try:
-                await asyncio.wait_for(found.wait(), timeout=MANUAL_SCAN_SECONDS)
-            except TimeoutError:
-                pass
-            finally:
-                unregister()
-
-        if not self._discovered_devices:
-            return self.async_abort(reason="no_devices_found")
-
         return self.async_show_form(
-            step_id="user",
+            step_id="pick_device",
             data_schema=vol.Schema(
                 {
                     vol.Required("address"): vol.In(self._discovered_devices),
@@ -170,7 +196,7 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
         except Exception as error:  # noqa: BLE001 - see async_step_confirm
             _LOGGER.debug("ONNAIS secret import failed: %s", error)
             return self.async_show_form(
-                step_id="user",
+                step_id="pick_device",
                 errors={"base": "invalid_secret"},
                 data_schema=vol.Schema(
                     {vol.Required("address", default=address): str, vol.Optional(CONF_SECRET): str}
