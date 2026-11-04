@@ -16,6 +16,7 @@ Two paths into setup:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 
@@ -28,6 +29,8 @@ from .const import CONF_SECRET, DOMAIN, FACTORY_DEFAULT_SECRET
 from .lock_api import OnnaisAuthError, OnnaisLockClient
 
 _LOGGER = logging.getLogger(__name__)
+
+MANUAL_SCAN_SECONDS = 25
 
 
 def _generate_secret() -> bytes:
@@ -66,6 +69,35 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
                 continue
             if info.name and info.name.startswith("MH_safe"):
                 self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+
+        if not self._discovered_devices:
+            # The snapshot above only reflects advertisements HA has already
+            # cached -- this lock advertises in short, sparse bursts rather
+            # than continuously, so a cold snapshot very often comes back
+            # empty even when the lock is powered and in range. Actively
+            # listen for a live advertisement for a while before giving up,
+            # instead of failing instantly.
+            found = asyncio.Event()
+
+            @bluetooth.callback
+            def _on_advertisement(info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
+                if info.address in current_addresses or info.address in self._discovered_devices:
+                    return
+                self._discovered_devices[info.address] = f"{info.name} ({info.address})"
+                found.set()
+
+            unregister = bluetooth.async_register_callback(
+                self.hass,
+                _on_advertisement,
+                bluetooth.BluetoothCallbackMatcher(connectable=True, local_name="MH_safe*"),
+                bluetooth.BluetoothScanningMode.ACTIVE,
+            )
+            try:
+                await asyncio.wait_for(found.wait(), timeout=MANUAL_SCAN_SECONDS)
+            except TimeoutError:
+                pass
+            finally:
+                unregister()
 
         if not self._discovered_devices:
             return self.async_abort(reason="no_devices_found")

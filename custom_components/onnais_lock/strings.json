@@ -21,7 +21,7 @@
     },
     "abort": {
       "already_configured": "This lock is already set up.",
-      "no_devices_found": "No ONNAIS locks found. Make sure the lock is powered and within Bluetooth range.",
+      "no_devices_found": "No ONNAIS locks found after a 25-second scan. The lock advertises in short, sparse bursts rather than continuously -- try again, and make sure it's powered and within range (or within range of a Bluetooth proxy).",
       "not_visible": "That lock isn't currently visible to Home Assistant's Bluetooth stack."
     }
   },
