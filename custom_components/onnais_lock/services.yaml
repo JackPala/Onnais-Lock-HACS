@@ -1,0 +1,124 @@
+set_temp_password:
+  name: Set temporary passcode
+  description: Programs a keypad passcode into one of the lock's 10 temp-password slots.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+    slot:
+      name: Slot
+      description: Passcode slot, 0-9.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 9
+          mode: box
+    passcode:
+      name: Passcode
+      description: 1-9 digit numeric passcode.
+      required: true
+      selector:
+        text:
+
+delete_temp_password:
+  name: Delete temporary passcode
+  description: Clears one of the lock's temp-password slots.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 9
+          mode: box
+
+delete_fingerprint:
+  name: Delete fingerprint
+  description: Clears a programmed fingerprint slot.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+
+begin_add_key_fob:
+  name: Begin adding a key fob
+  description: Puts the lock into fob-enrollment mode; press the new fob near the lock within a few seconds.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+
+delete_key_fob:
+  name: Delete key fob
+  description: Clears a programmed key fob slot.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+    slot:
+      name: Slot
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+
+cancel_operation:
+  name: Cancel current operation
+  description: Cancels an in-progress enrollment/programming operation on the lock.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+
+unbind:
+  name: Unbind (factory reset owner secret)
+  description: >-
+    Destructive. Resets the lock's owner secret back to the vendor default,
+    discarding the secret this integration claimed. You will need to run
+    through setup again (pairing mode included) to reclaim it.
+  fields:
+    entity_id:
+      name: Lock
+      required: false
+      selector:
+        entity:
+          domain: lock
+    confirm:
+      name: Confirm
+      description: Must be true. Safety guard against accidental calls.
+      required: true
+      selector:
+        boolean:

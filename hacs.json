@@ -1,0 +1,9 @@
+{
+  "name": "ONNAIS RV Lock",
+  "render_readme": true,
+  "content_in_root": false,
+  "domains": ["lock"],
+  "country": ["US"],
+  "homeassistant": "2024.6.0",
+  "iot_class": "local_polling"
+}
