@@ -23,6 +23,7 @@ import secrets
 import voluptuous as vol
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigFlow
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import CONF_SECRET, DOMAIN, FACTORY_DEFAULT_SECRET
@@ -79,7 +80,7 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
             # instead of failing instantly.
             found = asyncio.Event()
 
-            @bluetooth.callback
+            @callback
             def _on_advertisement(info: bluetooth.BluetoothServiceInfoBleak, change) -> None:
                 if info.address in current_addresses or info.address in self._discovered_devices:
                     return
