@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -11,24 +10,33 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import POLL_INTERVAL_SECONDS
 from .lock_api import OnnaisAuthError, OnnaisCommandError, OnnaisLockClient
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class OnnaisCoordinator(DataUpdateCoordinator[dict]):
-    """Fetches lock/battery/buzzer/keypad-light/code status on an interval,
-    and is also the shared place entities and services reach the BLE client
-    through, so every connection goes through one coordinated session at a
-    time rather than racing concurrent BLE connects to the same radio."""
+    """Fetches lock/battery/buzzer/keypad-light/code status, and is also
+    the shared place entities and services reach the BLE client through, so
+    every connection goes through one coordinated session at a time rather
+    than racing concurrent BLE connects to the same radio.
+
+    There is deliberately no periodic timer here (``update_interval`` is
+    left unset). Every operation is a fresh BLE connect (see lock_api.py),
+    and this lock audibly chirps once per successful connection -- polling
+    it on a schedule just for the sake of it would mean the lock beeping
+    at you every few minutes for no reason. Instead, a status refresh only
+    happens when something actually connects to it anyway: once at startup
+    (``async_config_entry_first_refresh``) and after every lock/unlock or
+    service call (``async_run_command`` below already requests a refresh).
+    """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, address: str, secret: bytes) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=f"onnais_lock_{address}",
-            update_interval=timedelta(seconds=POLL_INTERVAL_SECONDS),
+            update_interval=None,
         )
         self.address = address
         self.entry = entry
