@@ -28,7 +28,21 @@ PLATFORMS = ["lock", "sensor", "switch"]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     secret = bytes.fromhex(entry.data[CONF_SECRET])
     coordinator = OnnaisCoordinator(hass, entry, entry.data["address"], secret)
-    await coordinator.async_config_entry_first_refresh()
+    # Deliberately async_refresh(), not async_config_entry_first_refresh().
+    # The latter raises ConfigEntryNotReady on failure, which makes Home
+    # Assistant retry this entire setup function every 5 seconds forever
+    # while the lock is unreachable -- and each of those retries runs our
+    # own multi-attempt connect logic (~2 minutes of hammering per cycle),
+    # producing a near-continuous storm of connection attempts (and, since
+    # this lock chirps on connect, audible beeping every 1-2 minutes) for
+    # as long as it's out of range. A vehicle-mounted BLE lock being
+    # temporarily out of range is an expected, ordinary condition, not a
+    # setup failure: async_refresh() lets setup finish immediately either
+    # way, with entities simply starting "unavailable" if the first fetch
+    # fails. The periodic 10-minute reconcile (and any lock/unlock
+    # attempt) still recovers it once it's back in range -- without ever
+    # retrying in a tight loop.
+    await coordinator.async_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

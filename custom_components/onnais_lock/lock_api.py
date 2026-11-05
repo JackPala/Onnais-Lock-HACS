@@ -39,7 +39,12 @@ import logging
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    BleakNotFoundError,
+    BleakOutOfConnectionSlotsError,
+    establish_connection,
+)
 
 from .const import (
     COMMAND_TIMEOUT,
@@ -67,7 +72,7 @@ _LOGGER = logging.getLogger(__name__)
 # deterministic protocol-level rejections, and retrying one blindly would
 # just fail again (or risk tripping the lock's own rate limiting).
 TRANSIENT_ERRORS = (BleakError, TimeoutError, OSError, EOFError, BrokenPipeError, AttributeError)
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 2
 
 
 class OnnaisAuthError(Exception):
@@ -167,6 +172,16 @@ class OnnaisLockClient:
                     client = await self._connect()
                     await self._authenticate(client, self._secret)
                     return await work(client)
+                except (BleakNotFoundError, BleakOutOfConnectionSlotsError) as error:
+                    # Either the device isn't currently visible to any
+                    # scanner at all (e.g. this lock is vehicle-mounted and
+                    # genuinely out of range right now), or the proxy has
+                    # no free connection slot. Retrying within the same
+                    # second can't fix either -- it would just burn time
+                    # hammering a device nothing can even see/reach. Fail
+                    # immediately instead; the next periodic reconcile or
+                    # user action will naturally try again later.
+                    raise OnnaisCommandError(f"Lock not currently reachable: {error}") from error
                 except TRANSIENT_ERRORS as error:
                     last_error = error
                     _LOGGER.debug(
