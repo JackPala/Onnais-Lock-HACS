@@ -87,6 +87,16 @@ class OnnaisLockClient:
         self._client: BleakClient | None = None
         self._stream = FrameStream()
         self._replies: asyncio.Queue = asyncio.Queue()
+        # Serializes every operation against this one lock. Without this,
+        # a user tapping lock/unlock repeatedly (or a tap landing at the
+        # same moment as a periodic status refresh) fires multiple
+        # concurrent connection attempts at the same physical address
+        # through the same Bluetooth proxy -- observed live as a storm of
+        # near-simultaneous "Timeout waiting for connect response" errors,
+        # since the proxy can't usefully service several connects to the
+        # same peripheral at once. Queuing them one at a time here is what
+        # the coordinator's own docstring already claimed was happening.
+        self._op_lock = asyncio.Lock()
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         self._ble_device = ble_device
@@ -136,26 +146,39 @@ class OnnaisLockClient:
         failures instead of surfacing the first hiccup as a permanent
         failure. OnnaisAuthError/OnnaisCommandError (the lock's own
         deliberate protocol rejections) are never retried; they propagate
-        on the first attempt."""
-        last_error: Exception | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            client: BleakClient | None = None
-            try:
-                client = await self._connect()
-                await self._authenticate(client, self._secret)
-                return await work(client)
-            except TRANSIENT_ERRORS as error:
-                last_error = error
-                _LOGGER.debug(
-                    "ONNAIS %s: BLE attempt %d/%d failed, retrying: %s",
-                    self._ble_device.address, attempt, MAX_ATTEMPTS, error,
-                )
-            finally:
-                if client is not None:
-                    await client.disconnect()
-        raise OnnaisCommandError(
-            f"Lock unreachable after {MAX_ATTEMPTS} attempts: {last_error}"
-        ) from last_error
+        on the first attempt.
+
+        Guarded by self._op_lock so overlapping calls (rapid repeat taps, a
+        refresh landing mid-command) can't race each other for the same
+        BLE connection. Rather than silently queuing every extra tap behind
+        a slow in-flight attempt -- which, mashed enough times, can take
+        minutes to drain -- an operation that's already running makes any
+        overlapping call fail immediately with a clear message instead.
+        """
+        if self._op_lock.locked():
+            raise OnnaisCommandError(
+                "Another ONNAIS operation is already in progress for this lock -- wait for it to finish."
+            )
+        async with self._op_lock:
+            last_error: Exception | None = None
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                client: BleakClient | None = None
+                try:
+                    client = await self._connect()
+                    await self._authenticate(client, self._secret)
+                    return await work(client)
+                except TRANSIENT_ERRORS as error:
+                    last_error = error
+                    _LOGGER.debug(
+                        "ONNAIS %s: BLE attempt %d/%d failed, retrying: %s",
+                        self._ble_device.address, attempt, MAX_ATTEMPTS, error,
+                    )
+                finally:
+                    if client is not None:
+                        await client.disconnect()
+            raise OnnaisCommandError(
+                f"Lock unreachable after {MAX_ATTEMPTS} attempts: {last_error}"
+            ) from last_error
 
     # -- high level operations, each a self-contained connect/auth/act/disconnect cycle --
 
