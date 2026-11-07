@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
@@ -48,7 +49,6 @@ from bleak_retry_connector import (
 
 from .const import (
     COMMAND_TIMEOUT,
-    CONNECT_TIMEOUT,
     FACTORY_DEFAULT_SECRET,
     NOTIFY_CHAR_UUID,
     SERVICE_UUID,
@@ -66,28 +66,38 @@ from .protocol import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Transient, transport-level failures worth retrying: a dropped/interrupted
-# link, a lost reply, a disconnect mid-operation. Deliberately does NOT
-# include OnnaisAuthError/OnnaisCommandError -- those are the lock's own
-# deterministic protocol-level rejections, and retrying one blindly would
-# just fail again (or risk tripping the lock's own rate limiting).
-TRANSIENT_ERRORS = (BleakError, TimeoutError, OSError, EOFError, BrokenPipeError, AttributeError)
+# Transient failures *after* a connection is up (a dropped link mid-
+# exchange, a lost notify reply) that are worth one more full try.
+# Deliberately excludes OnnaisAuthError/OnnaisCommandError (the lock's own
+# deliberate rejections) and generic programming errors like AttributeError,
+# which must surface as bugs rather than be silently retried.
+TRANSIENT_ERRORS = (BleakError, TimeoutError, OSError, EOFError, BrokenPipeError)
+# Whole connect+authenticate+act sequence attempts. Connection-establishment
+# retries happen *inside* establish_connection (CONNECT_ATTEMPTS below); this
+# outer retry only covers a link that came up and then failed mid-exchange.
 MAX_ATTEMPTS = 2
-# Hard ceiling on a single attempt's connect+authenticate+act sequence.
-# Several of the underlying bleak/esphome-proxy calls here (write_gatt_char,
-# start_notify) carry no timeout of their own -- if one of those were ever
-# to hang instead of raising, there would be nothing to stop it, and since
-# the whole thing runs under self._op_lock, a single stuck attempt would
-# permanently block every future command on this lock (and, worse, the
-# health-check coordinator retry too, since that goes through the exact
-# same lock) until Home Assistant was restarted. Wrapping the whole
-# sequence in one top-level timeout guarantees forward progress regardless
-# of which specific call is the one that misbehaves.
-PER_ATTEMPT_TIMEOUT = 90
-# Disconnect gets its own short, separate bound in a best-effort cleanup --
-# if disconnecting itself hangs, that would defeat the timeout above by
-# hanging in the `finally` clause instead.
+# bleak-retry-connector hard-codes each individual connect attempt to 20s.
+# This lock only accepts a connection when it next advertises, and its
+# advertising gap is on the same order as that 20s, so a single attempt is a
+# coin flip (observed live: a successful connect landing at 19.5s). Several
+# back-to-back attempts give a ~60s window to catch an advertisement, using
+# the library's supported knob instead of patching a global HA-wide constant.
+CONNECT_ATTEMPTS = 3
+# Hard ceiling on one full attempt so no single hung bleak/proxy call
+# (write_gatt_char, start_notify, ...) can hold the per-lock lock forever.
+# Background status checks (startup / health check) get a single 20s connect
+# try: they must never monopolise the proxy while a user is waiting.
+BACKGROUND_CONNECT_ATTEMPTS = 1
+PER_ATTEMPT_TIMEOUT = 100
 DISCONNECT_TIMEOUT = 10
+
+# Shared by every ONNAIS lock in this Home Assistant instance. A Bluetooth LE
+# controller can only have one outgoing connection being established at a
+# time, so two locks connecting through the same ESPHome proxy at once just
+# take turns on its single initiator -- observed live as an unreachable rear
+# lock's attempts overlapping (and starving) the front lock's. Serializing
+# connections here gives each attempt the radio's full attention.
+_RADIO_LOCK = asyncio.Lock()
 
 
 class OnnaisAuthError(Exception):
@@ -99,27 +109,41 @@ class OnnaisCommandError(Exception):
 
 
 class OnnaisLockClient:
-    """One-shot connect / authenticate / command / disconnect session."""
+    """Connect / authenticate / act / disconnect sessions against one lock.
 
-    def __init__(self, ble_device: BLEDevice, secret: bytes):
+    All sessions are serialized through ``self._op_lock``: callers that
+    arrive while another session is running wait their turn rather than
+    being rejected or racing a second connect at the same radio.
+    """
+
+    def __init__(
+        self,
+        ble_device: BLEDevice,
+        secret: bytes,
+        ble_device_callback: Callable[[], BLEDevice | None] | None = None,
+    ):
         self._ble_device = ble_device
         self._secret = bytes(secret)
-        self._client: BleakClient | None = None
+        self._ble_device_callback = ble_device_callback
         self._stream = FrameStream()
         self._replies: asyncio.Queue = asyncio.Queue()
-        # Serializes every operation against this one lock. Without this,
-        # a user tapping lock/unlock repeatedly (or a tap landing at the
-        # same moment as a periodic status refresh) fires multiple
-        # concurrent connection attempts at the same physical address
-        # through the same Bluetooth proxy -- observed live as a storm of
-        # near-simultaneous "Timeout waiting for connect response" errors,
-        # since the proxy can't usefully service several connects to the
-        # same peripheral at once. Queuing them one at a time here is what
-        # the coordinator's own docstring already claimed was happening.
         self._op_lock = asyncio.Lock()
+
+    @property
+    def busy(self) -> bool:
+        return self._op_lock.locked()
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         self._ble_device = ble_device
+
+    def _latest_ble_device(self) -> BLEDevice:
+        """Freshest BLEDevice (i.e. best currently-reachable proxy path) for
+        each connect attempt, falling back to the last one we knew about."""
+        if self._ble_device_callback is not None:
+            device = self._ble_device_callback()
+            if device is not None:
+                self._ble_device = device
+        return self._ble_device
 
     def _on_notify(self, _characteristic, data: bytearray) -> None:
         for kind, action, payload in self._stream.feed(bytes(data)):
@@ -135,13 +159,13 @@ class OnnaisLockClient:
                 if response_kind == kind and response_action == (0x80 | (action & 0x0F)):
                     return content
 
-    async def _connect(self) -> BleakClient:
+    async def _connect(self, connect_attempts: int = CONNECT_ATTEMPTS) -> BleakClient:
         client = await establish_connection(
             BleakClientWithServiceCache,
-            self._ble_device,
+            self._latest_ble_device(),
             self._ble_device.address,
-            timeout=CONNECT_TIMEOUT,
-            max_attempts=2,
+            max_attempts=connect_attempts,
+            ble_device_callback=self._latest_ble_device,
             use_services_cache=False,
         )
         try:
@@ -150,146 +174,123 @@ class OnnaisLockClient:
             self._stream = FrameStream()
             await client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)
             await asyncio.sleep(0.3)
-        except Exception:
-            await client.disconnect()
+        except BaseException:
+            await self._safe_disconnect(client)
             raise
         return client
+
+    async def _safe_disconnect(self, client: BleakClient) -> None:
+        try:
+            async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                await client.disconnect()
+        except Exception as error:  # noqa: BLE001 - best-effort cleanup only
+            _LOGGER.debug("ONNAIS %s: disconnect failed/timed out: %s", self._ble_device.address, error)
 
     async def _authenticate(self, client: BleakClient, secret: bytes) -> None:
         result = await self._request(client, 1, 2, bytes([len(secret)]) + secret)
         if result != b"\x00":
             raise OnnaisAuthError("Lock rejected the configured secret")
 
-    async def run(self, work):
-        """Connect, authenticate with the stored secret, run work(client),
-        disconnect -- retrying the whole sequence on transient transport
-        failures instead of surfacing the first hiccup as a permanent
-        failure. OnnaisAuthError/OnnaisCommandError (the lock's own
-        deliberate protocol rejections) are never retried; they propagate
-        on the first attempt.
+    async def _read_status(self, client: BleakClient) -> dict:
+        content = await self._request(client, 6, 3)
+        try:
+            return parse_full_status(content)
+        except ValueError:
+            return status_from_payload(content)
 
-        Guarded by self._op_lock so overlapping calls (rapid repeat taps, a
-        refresh landing mid-command) can't race each other for the same
-        BLE connection. Rather than silently queuing every extra tap behind
-        a slow in-flight attempt -- which, mashed enough times, can take
-        minutes to drain -- an operation that's already running makes any
-        overlapping call fail immediately with a clear message instead.
+    async def run(self, work, *, background: bool = False):
+        """Connect, authenticate, run ``work(client)``, disconnect.
+
+        Waits for any in-flight session on this lock first (never two
+        concurrent connects to one radio). Connection establishment is
+        retried inside establish_connection; a link that comes up and then
+        fails mid-exchange gets one more full attempt. A lock that no
+        scanner can currently see fails immediately -- nothing to connect
+        through, and retrying in the same second cannot change that.
         """
-        if self._op_lock.locked():
-            raise OnnaisCommandError(
-                "Another ONNAIS operation is already in progress for this lock -- wait for it to finish."
-            )
-        async with self._op_lock:
+        connect_attempts = BACKGROUND_CONNECT_ATTEMPTS if background else CONNECT_ATTEMPTS
+        attempts = 1 if background else MAX_ATTEMPTS
+        async with self._op_lock, _RADIO_LOCK:
             last_error: Exception | None = None
-            for attempt in range(1, MAX_ATTEMPTS + 1):
+            for attempt in range(1, attempts + 1):
                 client: BleakClient | None = None
                 try:
                     async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
-                        client = await self._connect()
+                        client = await self._connect(connect_attempts)
                         await self._authenticate(client, self._secret)
                         return await work(client)
                 except (BleakNotFoundError, BleakOutOfConnectionSlotsError) as error:
-                    # Either the device isn't currently visible to any
-                    # scanner at all (e.g. this lock is vehicle-mounted and
-                    # genuinely out of range right now), or the proxy has
-                    # no free connection slot. Retrying within the same
-                    # second can't fix either -- it would just burn time
-                    # hammering a device nothing can even see/reach. Fail
-                    # immediately instead; the next periodic reconcile or
-                    # user action will naturally try again later.
                     raise OnnaisCommandError(f"Lock not currently reachable: {error}") from error
                 except TRANSIENT_ERRORS as error:
                     last_error = error
                     _LOGGER.debug(
-                        "ONNAIS %s: BLE attempt %d/%d failed, retrying: %s",
-                        self._ble_device.address, attempt, MAX_ATTEMPTS, error,
+                        "ONNAIS %s: attempt %d/%d failed: %s",
+                        self._ble_device.address, attempt, attempts, error,
                     )
                 finally:
                     if client is not None:
-                        try:
-                            async with asyncio.timeout(DISCONNECT_TIMEOUT):
-                                await client.disconnect()
-                        except Exception as disconnect_error:  # noqa: BLE001 - best-effort
-                            # cleanup only; a hung/failed disconnect must never itself
-                            # block forever and defeat the timeout this is meant to
-                            # guarantee.
-                            _LOGGER.debug(
-                                "ONNAIS %s: disconnect after attempt %d failed/timed out: %s",
-                                self._ble_device.address, attempt, disconnect_error,
-                            )
+                        await self._safe_disconnect(client)
             raise OnnaisCommandError(
-                f"Lock unreachable after {MAX_ATTEMPTS} attempts: {last_error}"
+                f"Lock unreachable after {attempts} attempt(s): {last_error}"
             ) from last_error
 
-    # -- high level operations, each a self-contained connect/auth/act/disconnect cycle --
+    async def _command(self, kind: int, action: int, payload: bytes, accept, what: str) -> dict | None:
+        """Send one write command, then read status over the SAME connection.
 
-    async def get_status(self) -> dict:
+        Reading status in the same session (rather than a second connection
+        afterward) halves the connects per tap -- one beep, one radio
+        lottery -- and means a successful command can never be followed by
+        a failed separate refresh that wrongly marks the lock unavailable.
+        Returns the fresh status, or None if only the post-command status
+        read failed (the command itself still succeeded).
+        """
         async def work(client):
-            content = await self._request(client, 6, 3)
+            result = await self._request(client, kind, action, payload)
+            if not accept(result):
+                raise OnnaisCommandError(f"Lock rejected {what}")
             try:
-                return parse_full_status(content)
-            except ValueError:
-                return status_from_payload(content)
+                return await self._read_status(client)
+            except TRANSIENT_ERRORS as error:
+                _LOGGER.debug("ONNAIS %s: status read after %s failed: %s", self._ble_device.address, what, error)
+                return None
         return await self.run(work)
 
-    async def set_locked(self, locked: bool) -> None:
-        async def work(client):
-            result = await self._request(client, 6, 2 if locked else 1)
-            if result != b"\x00":
-                raise OnnaisCommandError("Lock rejected the lock/unlock command")
-        await self.run(work)
+    # -- high level operations, each one connect/auth/act/status/disconnect session --
 
-    async def set_buzzer(self, on: bool) -> None:
-        async def work(client):
-            result = await self._request(client, 5, 1, bytes([1 if on else 0]))
-            if result != b"\x00":
-                raise OnnaisCommandError("Lock rejected the buzzer toggle")
-        await self.run(work)
+    async def get_status(self, *, background: bool = False) -> dict:
+        return await self.run(self._read_status, background=background)
 
-    async def set_keypad_light(self, on: bool) -> None:
-        async def work(client):
-            result = await self._request(client, 5, 2, bytes([1 if on else 0]))
-            if result != b"\x00":
-                raise OnnaisCommandError("Lock rejected the keypad light toggle")
-        await self.run(work)
+    async def set_locked(self, locked: bool) -> dict | None:
+        return await self._command(6, 2 if locked else 1, b"", lambda r: r == b"\x00",
+                                   "the lock command" if locked else "the unlock command")
 
-    async def set_temp_password(self, slot: int, digits: str) -> None:
-        async def work(client):
-            content = await self._request(client, 2, 1, encode_set_temp_password(slot, digits))
-            if not temp_password_reply_ok(slot, content):
-                raise OnnaisCommandError(f"Lock rejected temp passcode for slot {slot}")
-        await self.run(work)
+    async def set_buzzer(self, on: bool) -> dict | None:
+        return await self._command(5, 1, bytes([1 if on else 0]), lambda r: r == b"\x00", "the buzzer toggle")
 
-    async def delete_temp_password(self, slot: int) -> None:
-        async def work(client):
-            content = await self._request(client, 2, 2, encode_delete_temp_password(slot))
-            if not temp_password_reply_ok(slot, content):
-                raise OnnaisCommandError(f"Lock rejected deleting temp passcode slot {slot}")
-        await self.run(work)
+    async def set_keypad_light(self, on: bool) -> dict | None:
+        return await self._command(5, 2, bytes([1 if on else 0]), lambda r: r == b"\x00", "the keypad light toggle")
 
-    async def delete_fingerprint(self, slot: int) -> None:
-        async def work(client):
-            result = await self._request(client, 2, 4, bytes([slot]))
-            if result != b"\x00":
-                raise OnnaisCommandError(f"Lock rejected deleting fingerprint slot {slot}")
-        await self.run(work)
+    async def set_temp_password(self, slot: int, digits: str) -> dict | None:
+        payload = encode_set_temp_password(slot, digits)  # validates before connecting
+        return await self._command(2, 1, payload, lambda r: temp_password_reply_ok(slot, r),
+                                   f"temp passcode for slot {slot}")
 
-    async def begin_add_key_fob(self) -> None:
-        async def work(client):
-            await self._request(client, 2, 7)
-        await self.run(work)
+    async def delete_temp_password(self, slot: int) -> dict | None:
+        payload = encode_delete_temp_password(slot)
+        return await self._command(2, 2, payload, lambda r: temp_password_reply_ok(slot, r),
+                                   f"deleting temp passcode slot {slot}")
 
-    async def delete_key_fob(self, slot: int) -> None:
-        async def work(client):
-            result = await self._request(client, 2, 8, bytes([slot]))
-            if result != b"\x00":
-                raise OnnaisCommandError(f"Lock rejected deleting key fob slot {slot}")
-        await self.run(work)
+    async def delete_fingerprint(self, slot: int) -> dict | None:
+        return await self._command(2, 4, bytes([slot]), lambda r: r == b"\x00", f"deleting fingerprint slot {slot}")
 
-    async def cancel_operation(self) -> None:
-        async def work(client):
-            await self._request(client, 2, 9)
-        await self.run(work)
+    async def begin_add_key_fob(self) -> dict | None:
+        return await self._command(2, 7, b"", lambda r: True, "starting key fob enrollment")
+
+    async def delete_key_fob(self, slot: int) -> dict | None:
+        return await self._command(2, 8, bytes([slot]), lambda r: r == b"\x00", f"deleting key fob slot {slot}")
+
+    async def cancel_operation(self) -> dict | None:
+        return await self._command(2, 9, b"", lambda r: True, "cancel")
 
     async def unbind(self) -> None:
         """Factory-resets the lock's owner secret. Destructive and
@@ -309,7 +310,7 @@ class OnnaisLockClient:
         returning. Raises OnnaisAuthError if the lock is already bound to a
         different secret (e.g. still paired with the official app)."""
         probe = OnnaisLockClient(ble_device, old_secret)
-        async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
+        async with _RADIO_LOCK, asyncio.timeout(PER_ATTEMPT_TIMEOUT):
             client = await probe._connect()
             try:
                 await probe._authenticate(client, old_secret)
@@ -318,8 +319,4 @@ class OnnaisLockClient:
                     raise OnnaisCommandError("Lock rejected the new owner secret")
                 await probe._authenticate(client, new_secret)
             finally:
-                try:
-                    async with asyncio.timeout(DISCONNECT_TIMEOUT):
-                        await client.disconnect()
-                except Exception as disconnect_error:  # noqa: BLE001 - best-effort cleanup only
-                    _LOGGER.debug("ONNAIS %s: disconnect after claim failed/timed out: %s", ble_device.address, disconnect_error)
+                await probe._safe_disconnect(client)

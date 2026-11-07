@@ -25,7 +25,6 @@ MANUFACTURER_ID = 54976  # 0xD6C0, non-SIG-registered vendor value
 CONF_SECRET = "secret"
 
 COMMAND_TIMEOUT = 12
-CONNECT_TIMEOUT = 30
 
 ATTR_BATTERY = "battery"
 ATTR_BUZZER = "buzzer"

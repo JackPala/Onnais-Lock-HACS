@@ -1,4 +1,4 @@
-"""Polling coordinator for a single ONNAIS lock config entry."""
+"""Coordinator for a single ONNAIS lock config entry."""
 
 from __future__ import annotations
 
@@ -8,40 +8,29 @@ from datetime import timedelta
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .lock_api import OnnaisAuthError, OnnaisCommandError, OnnaisLockClient
 
 _LOGGER = logging.getLogger(__name__)
 
+AUTH_FAILED_MESSAGE = (
+    "The lock rejected Home Assistant's stored secret -- it may have been "
+    "unbound/rebound outside Home Assistant. Remove and re-add this lock."
+)
 
 HEALTH_CHECK_INTERVAL = timedelta(minutes=5)
-# This is NOT a routine poll -- see _async_update_data's gating logic. It
-# exists for exactly one reason: without it, a lock that fails its one and
-# only startup connection (easily possible with this lock's weak signal)
-# would stay "unavailable" forever, with no periodic timer to ever retry
-# and no way for the user to force one either, since Home Assistant
-# disables the lock/unlock buttons on an unavailable entity -- observed
-# live as both locks being completely stuck, uncontrollable, for two full
-# days. While everything is healthy, ticks on this interval are skipped
-# entirely (no connection, no chirp); they only do real work -- and retry
-# every five minutes until they succeed -- while the lock is in a known-bad
-# state. A successful recovery beeps once, same as any other connection;
-# that's an acceptable, rare price for "doesn't get stranded for days."
+# Not a routine poll. Every connection makes this lock chirp, so while the
+# last status read succeeded these ticks are skipped entirely (no connection,
+# no beep). They only do real work while the last read failed, or after a
+# command whose outcome couldn't be confirmed -- so a bad moment on the radio
+# self-corrects instead of leaving stale state indefinitely.
 
 
 class OnnaisCoordinator(DataUpdateCoordinator[dict]):
-    """Fetches lock/battery/buzzer/keypad-light/code status, and is also
-    the shared place entities and services reach the BLE client through, so
-    every connection goes through one coordinated session at a time rather
-    than racing concurrent BLE connects to the same radio.
-
-    Status refreshes at startup, immediately after every lock/unlock or
-    service call (``async_run_command`` below), and -- only while in a
-    failed state -- on HEALTH_CHECK_INTERVAL until it recovers. A healthy
-    lock makes zero background connections and stays silent.
-    """
+    """Owns the BLE client for one lock and is the single path every
+    status read and command goes through."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, address: str, secret: bytes) -> None:
         super().__init__(
@@ -52,55 +41,66 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
         )
         self.address = address
         self.entry = entry
-        # Lets the very first _async_update_data call run for real even
-        # though last_update_success defaults to True before any update
-        # has ever run (which would otherwise make the gate below skip it).
         self._force_refresh = True
-        ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
+        self._command_pending = False
+        ble_device = self._lookup_ble_device()
         if ble_device is None:
             raise ConfigEntryNotReady(f"ONNAIS lock {address} not currently visible to Home Assistant's Bluetooth stack")
-        self.client = OnnaisLockClient(ble_device, secret)
+        self.client = OnnaisLockClient(ble_device, secret, ble_device_callback=self._lookup_ble_device)
 
-    def _refresh_ble_device(self) -> None:
-        ble_device = bluetooth.async_ble_device_from_address(self.hass, self.address, connectable=True)
-        if ble_device is not None:
-            self.client.update_ble_device(ble_device)
+    def _lookup_ble_device(self):
+        return bluetooth.async_ble_device_from_address(self.hass, self.address, connectable=True)
 
     async def _async_update_data(self) -> dict:
-        # Skip a routine HEALTH_CHECK_INTERVAL tick while everything is
-        # already known to be working -- only a forced refresh (an actual
-        # lock/unlock/service call) or recovering from a failure actually
-        # connects. See HEALTH_CHECK_INTERVAL's comment for why.
-        if self.last_update_success and not self._force_refresh and self.data is not None:
+        if self.data is not None and self.last_update_success and not self._force_refresh:
             return self.data
-        self._force_refresh = False
-
-        self._refresh_ble_device()
+        if self.client.busy or self._command_pending:
+            # A command is running and reports fresh status itself; don't
+            # queue a second connection behind it.
+            if self.data is not None:
+                return self.data
+            raise UpdateFailed("Lock busy with another operation")
         try:
-            return await self.client.get_status()
+            data = await self.client.get_status(background=True)
         except OnnaisAuthError as error:
-            raise ConfigEntryNotReady(
-                "ONNAIS lock rejected its stored secret -- it may have been "
-                "unbound/rebound outside Home Assistant. Remove and re-add "
-                "this lock to re-claim it."
-            ) from error
+            raise UpdateFailed(AUTH_FAILED_MESSAGE) from error
         except OnnaisCommandError as error:
             raise UpdateFailed(str(error)) from error
-        except Exception as error:  # noqa: BLE001 - any BLE/transport failure (BleakError,
-            # TimeoutError, OSError, the "le-connection-abort-by-local" family, etc.) must
-            # become UpdateFailed, never an unhandled exception out of a coordinator update.
+        except Exception as error:  # noqa: BLE001 - never let a BLE failure escape a coordinator update
             raise UpdateFailed(f"BLE error talking to lock: {error}") from error
+        self._force_refresh = False
+        return data
 
-    async def async_run_command(self, coro_factory):
-        """Run a write command then force an immediate status refresh so
-        entities reflect the lock's own confirmed state, not just the
-        command's local success. The refresh still runs even if the
-        command itself raised: a reply can get lost in transit after the
-        lock has already physically acted on it, so checking the real
-        state afterward beats trusting our own success/failure guess."""
-        self._force_refresh = True
-        self._refresh_ble_device()
+    async def async_run_command(self, coro_factory) -> None:
+        """Run one command session (which also reads status over the same
+        connection) and publish that status.
+
+        Waits behind any in-flight background read rather than failing.
+        A second tap while a command is already queued is rejected, so
+        mashing a button can't pile up minutes of queued connects.
+        """
+        if self._command_pending:
+            raise HomeAssistantError("Still working on the previous command for this lock -- give it a moment.")
+        self._command_pending = True
         try:
-            await coro_factory()
+            status = await coro_factory()
+        except OnnaisAuthError as error:
+            self._force_refresh = True
+            raise HomeAssistantError(AUTH_FAILED_MESSAGE) from error
+        except OnnaisCommandError as error:
+            # The lock may still have acted (a reply can be lost after it
+            # moved), so the next health-check tick verifies real state.
+            self._force_refresh = True
+            raise HomeAssistantError(f"Lock didn't respond: {error}") from error
+        except Exception as error:  # noqa: BLE001
+            self._force_refresh = True
+            raise HomeAssistantError(f"Bluetooth error talking to lock: {error}") from error
         finally:
-            await self.async_request_refresh()
+            self._command_pending = False
+
+        if status is not None:
+            self._force_refresh = False
+            self.async_set_updated_data(status)
+        else:
+            # Command succeeded but the same-session status read didn't.
+            self._force_refresh = True

@@ -5,7 +5,9 @@ from __future__ import annotations
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     ATTR_PASSCODE,
@@ -28,21 +30,14 @@ PLATFORMS = ["lock", "sensor", "switch"]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     secret = bytes.fromhex(entry.data[CONF_SECRET])
     coordinator = OnnaisCoordinator(hass, entry, entry.data["address"], secret)
-    # Deliberately async_refresh(), not async_config_entry_first_refresh().
-    # The latter raises ConfigEntryNotReady on failure, which makes Home
-    # Assistant retry this entire setup function every 5 seconds forever
-    # while the lock is unreachable -- and each of those retries runs our
-    # own multi-attempt connect logic (~2 minutes of hammering per cycle),
-    # producing a near-continuous storm of connection attempts (and, since
-    # this lock chirps on connect, audible beeping every 1-2 minutes) for
-    # as long as it's out of range. A vehicle-mounted BLE lock being
-    # temporarily out of range is an expected, ordinary condition, not a
-    # setup failure: async_refresh() lets setup finish immediately either
-    # way, with entities simply starting "unavailable" if the first fetch
-    # fails. The periodic 10-minute reconcile (and any lock/unlock
-    # attempt) still recovers it once it's back in range -- without ever
-    # retrying in a tight loop.
-    await coordinator.async_refresh()
+    # Initial status read runs in the background: it can take tens of
+    # seconds on this link (or fail), and must neither block Home
+    # Assistant's startup nor fail setup (ConfigEntryNotReady would make HA
+    # retry setup in a tight loop, each retry a fresh connect + chirp).
+    # Entities start with unknown state and fill in when it completes.
+    entry.async_create_background_task(
+        hass, coordinator.async_refresh(), name=f"onnais_lock initial refresh {entry.data['address']}"
+    )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -62,16 +57,18 @@ def _register_services(hass: HomeAssistant) -> None:
         return  # already registered by an earlier config entry
 
     async def _coordinator_for_call(call: ServiceCall) -> OnnaisCoordinator:
-        entity_registry_ids = call.data.get("entity_id", [])
-        for coordinator in hass.data.get(DOMAIN, {}).values():
-            for entity_id in entity_registry_ids:
-                if coordinator.address in entity_id:
-                    return coordinator
-        # Single-lock installs: just use the only coordinator present.
-        coordinators = list(hass.data.get(DOMAIN, {}).values())
+        coordinators: dict = hass.data.get(DOMAIN, {})
+        entity_ids = call.data.get("entity_id") or []
+        if entity_ids:
+            registry = er.async_get(hass)
+            for entity_id in entity_ids:
+                entry_ = registry.async_get(entity_id)
+                if entry_ is not None and entry_.config_entry_id in coordinators:
+                    return coordinators[entry_.config_entry_id]
+            raise HomeAssistantError(f"None of {entity_ids} belong to an ONNAIS lock")
         if len(coordinators) == 1:
-            return coordinators[0]
-        raise ValueError("Could not resolve which ONNAIS lock this service call targets")
+            return next(iter(coordinators.values()))
+        raise HomeAssistantError("More than one ONNAIS lock is set up -- pick the target lock entity")
 
     async def set_temp_password(call: ServiceCall) -> None:
         coordinator = await _coordinator_for_call(call)
@@ -101,12 +98,12 @@ def _register_services(hass: HomeAssistant) -> None:
 
     async def unbind(call: ServiceCall) -> None:
         if not call.data.get("confirm"):
-            raise ValueError(
+            raise HomeAssistantError(
                 "unbind is destructive (factory-resets the lock's owner secret). "
                 "Call again with confirm: true to proceed."
             )
         coordinator = await _coordinator_for_call(call)
-        await coordinator.client.unbind()
+        await coordinator.async_run_command(coordinator.client.unbind)
 
     hass.services.async_register(
         DOMAIN, SERVICE_SET_TEMP_PASSWORD, set_temp_password,

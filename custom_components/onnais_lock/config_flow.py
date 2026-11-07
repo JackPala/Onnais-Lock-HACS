@@ -150,9 +150,18 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
             if self._discovery_info is None:
                 return self.async_abort(reason="not_visible")
             if user_input.get(CONF_SECRET):
-                return await self._finish_with_existing_secret(address, bytes.fromhex(user_input[CONF_SECRET]))
+                try:
+                    secret = bytes.fromhex(user_input[CONF_SECRET].strip())
+                except ValueError:
+                    secret = b""
+                if not secret:
+                    return self._pick_device_form({"base": "invalid_secret"})
+                return await self._finish_with_existing_secret(address, secret)
             return await self.async_step_confirm()
 
+        return self._pick_device_form()
+
+    def _pick_device_form(self, errors: dict | None = None) -> FlowResult:
         return self.async_show_form(
             step_id="pick_device",
             data_schema=vol.Schema(
@@ -161,6 +170,7 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Optional(CONF_SECRET): str,
                 }
             ),
+            errors=errors or {},
         )
 
     async def async_step_confirm(self, user_input: dict | None = None) -> FlowResult:
@@ -219,13 +229,9 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
             await client.get_status()
         except Exception as error:  # noqa: BLE001 - see async_step_confirm
             _LOGGER.debug("ONNAIS secret import failed: %s", error)
-            return self.async_show_form(
-                step_id="pick_device",
-                errors={"base": "invalid_secret"},
-                data_schema=vol.Schema(
-                    {vol.Required("address", default=address): str, vol.Optional(CONF_SECRET): str}
-                ),
-            )
+            if address not in self._discovered_devices:
+                self._discovered_devices[address] = address
+            return self._pick_device_form({"base": "invalid_secret"})
         return self.async_create_entry(
             title=self._discovery_info.name or address,
             data={"address": address, CONF_SECRET: secret.hex()},

@@ -7,10 +7,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OnnaisCoordinator
+from .entity import OnnaisEntity
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -21,8 +21,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     ])
 
 
-class _OnnaisSensorBase(CoordinatorEntity[OnnaisCoordinator], SensorEntity):
-    _attr_has_entity_name = True
+class _OnnaisSensorBase(OnnaisEntity, SensorEntity):
 
     def __init__(self, coordinator: OnnaisCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
