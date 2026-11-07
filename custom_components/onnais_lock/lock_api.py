@@ -73,6 +73,21 @@ _LOGGER = logging.getLogger(__name__)
 # just fail again (or risk tripping the lock's own rate limiting).
 TRANSIENT_ERRORS = (BleakError, TimeoutError, OSError, EOFError, BrokenPipeError, AttributeError)
 MAX_ATTEMPTS = 2
+# Hard ceiling on a single attempt's connect+authenticate+act sequence.
+# Several of the underlying bleak/esphome-proxy calls here (write_gatt_char,
+# start_notify) carry no timeout of their own -- if one of those were ever
+# to hang instead of raising, there would be nothing to stop it, and since
+# the whole thing runs under self._op_lock, a single stuck attempt would
+# permanently block every future command on this lock (and, worse, the
+# health-check coordinator retry too, since that goes through the exact
+# same lock) until Home Assistant was restarted. Wrapping the whole
+# sequence in one top-level timeout guarantees forward progress regardless
+# of which specific call is the one that misbehaves.
+PER_ATTEMPT_TIMEOUT = 90
+# Disconnect gets its own short, separate bound in a best-effort cleanup --
+# if disconnecting itself hangs, that would defeat the timeout above by
+# hanging in the `finally` clause instead.
+DISCONNECT_TIMEOUT = 10
 
 
 class OnnaisAuthError(Exception):
@@ -169,9 +184,10 @@ class OnnaisLockClient:
             for attempt in range(1, MAX_ATTEMPTS + 1):
                 client: BleakClient | None = None
                 try:
-                    client = await self._connect()
-                    await self._authenticate(client, self._secret)
-                    return await work(client)
+                    async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
+                        client = await self._connect()
+                        await self._authenticate(client, self._secret)
+                        return await work(client)
                 except (BleakNotFoundError, BleakOutOfConnectionSlotsError) as error:
                     # Either the device isn't currently visible to any
                     # scanner at all (e.g. this lock is vehicle-mounted and
@@ -190,7 +206,17 @@ class OnnaisLockClient:
                     )
                 finally:
                     if client is not None:
-                        await client.disconnect()
+                        try:
+                            async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                                await client.disconnect()
+                        except Exception as disconnect_error:  # noqa: BLE001 - best-effort
+                            # cleanup only; a hung/failed disconnect must never itself
+                            # block forever and defeat the timeout this is meant to
+                            # guarantee.
+                            _LOGGER.debug(
+                                "ONNAIS %s: disconnect after attempt %d failed/timed out: %s",
+                                self._ble_device.address, attempt, disconnect_error,
+                            )
             raise OnnaisCommandError(
                 f"Lock unreachable after {MAX_ATTEMPTS} attempts: {last_error}"
             ) from last_error
@@ -283,12 +309,17 @@ class OnnaisLockClient:
         returning. Raises OnnaisAuthError if the lock is already bound to a
         different secret (e.g. still paired with the official app)."""
         probe = OnnaisLockClient(ble_device, old_secret)
-        client = await probe._connect()
-        try:
-            await probe._authenticate(client, old_secret)
-            result = await probe._request(client, 1, 1, bytes([len(new_secret)]) + new_secret)
-            if result != b"\x00":
-                raise OnnaisCommandError("Lock rejected the new owner secret")
-            await probe._authenticate(client, new_secret)
-        finally:
-            await client.disconnect()
+        async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
+            client = await probe._connect()
+            try:
+                await probe._authenticate(client, old_secret)
+                result = await probe._request(client, 1, 1, bytes([len(new_secret)]) + new_secret)
+                if result != b"\x00":
+                    raise OnnaisCommandError("Lock rejected the new owner secret")
+                await probe._authenticate(client, new_secret)
+            finally:
+                try:
+                    async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                        await client.disconnect()
+                except Exception as disconnect_error:  # noqa: BLE001 - best-effort cleanup only
+                    _LOGGER.debug("ONNAIS %s: disconnect after claim failed/timed out: %s", ble_device.address, disconnect_error)
