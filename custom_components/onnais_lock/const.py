@@ -24,6 +24,14 @@ MANUFACTURER_ID = 54976  # 0xD6C0, non-SIG-registered vendor value
 
 CONF_SECRET = "secret"
 
+# Options: seconds between status reads. 0 (default) = no routine polling;
+# status is read at startup, after every command, and only retried in the
+# background while the last read failed.
+CONF_POLL_INTERVAL = "poll_interval"
+DEFAULT_POLL_INTERVAL = 0
+MIN_POLL_INTERVAL = 30
+MAX_POLL_INTERVAL = 86400
+
 COMMAND_TIMEOUT = 12
 
 ATTR_BATTERY = "battery"

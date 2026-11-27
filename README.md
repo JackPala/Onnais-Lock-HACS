@@ -55,6 +55,28 @@ If the lock is already claimed (by this project's own tooling, or a
 previous HA setup), the manual setup step accepts an existing hex secret
 instead, importing it without repeating pairing mode.
 
+### Polling interval (optional)
+
+**Settings → Devices & services → ONNAIS RV Lock → Configure** (per lock).
+
+- **0 (default):** no routine polling. State is read at startup and after
+  every command sent through Home Assistant, and retried in the background
+  only while the last read failed. A lock/unlock done with the keypad, key or
+  fob shows up the next time Home Assistant talks to the lock.
+- **30 or more:** reads the lock's state every N seconds, so keypad/key/fob
+  changes appear within that time.
+
+With polling enabled, Home Assistant keeps one Bluetooth connection to the
+lock open and polls over it (the same model as the vendor app while a lock's
+page is open), which also makes commands respond faster.
+
+> [!NOTE]
+> The lock chirps every time a new Bluetooth connection is established, even
+> with the Buzzer switch off. With polling on you'll hear one chirp when the
+> connection opens, and again only if it drops and reconnects. Polls over the
+> open connection are silent. A held connection uses more of the lock's
+> battery, and one connection slot on your Bluetooth adapter or proxy.
+
 ---
 
 ## How it works

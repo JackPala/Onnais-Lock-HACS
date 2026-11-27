@@ -32,12 +32,18 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
     """Owns the BLE client for one lock and is the single path every
     status read and command goes through."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, address: str, secret: bytes) -> None:
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, address: str, secret: bytes, poll_interval: int = 0
+    ) -> None:
+        # poll_interval > 0: read real status every poll_interval seconds
+        # (each read is a connection, so the lock may chirp each time).
+        # poll_interval == 0: the beep-free behaviour described above.
+        self.poll_interval = poll_interval
         super().__init__(
             hass,
             _LOGGER,
             name=f"onnais_lock_{address}",
-            update_interval=HEALTH_CHECK_INTERVAL,
+            update_interval=timedelta(seconds=poll_interval) if poll_interval > 0 else HEALTH_CHECK_INTERVAL,
         )
         self.address = address
         self.entry = entry
@@ -47,12 +53,20 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
         if ble_device is None:
             raise ConfigEntryNotReady(f"ONNAIS lock {address} not currently visible to Home Assistant's Bluetooth stack")
         self.client = OnnaisLockClient(ble_device, secret, ble_device_callback=self._lookup_ble_device)
+        # Polling: hold the connection open between polls (one chirp per
+        # connect, not per poll) -- the vendor app's own connection model.
+        self.client.persistent = poll_interval > 0
 
     def _lookup_ble_device(self):
         return bluetooth.async_ble_device_from_address(self.hass, self.address, connectable=True)
 
     async def _async_update_data(self) -> dict:
-        if self.data is not None and self.last_update_success and not self._force_refresh:
+        if (
+            self.poll_interval == 0
+            and self.data is not None
+            and self.last_update_success
+            and not self._force_refresh
+        ):
             return self.data
         if self.client.busy or self._command_pending:
             # A command is running and reports fresh status itself; don't

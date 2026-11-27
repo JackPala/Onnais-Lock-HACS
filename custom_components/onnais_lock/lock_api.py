@@ -128,6 +128,18 @@ class OnnaisLockClient:
         self._stream = FrameStream()
         self._replies: asyncio.Queue = asyncio.Queue()
         self._op_lock = asyncio.Lock()
+        # Persistent mode (used when polling is enabled): keep one
+        # authenticated connection open between operations, the way the
+        # vendor app does while a lock's page is open. The lock chirps when
+        # a connection is established, so reusing one link means one chirp
+        # per (re)connect instead of one per poll.
+        self.persistent = False
+        self._held: BleakClient | None = None
+        self.connects = 0  # established connections (diagnostics)
+
+    @property
+    def held_connection(self) -> bool:
+        return self._held is not None and self._held.is_connected
 
     @property
     def busy(self) -> bool:
@@ -159,15 +171,25 @@ class OnnaisLockClient:
                 if response_kind == kind and response_action == (0x80 | (action & 0x0F)):
                     return content
 
+    def _on_disconnected(self, client: BleakClient) -> None:
+        if client is self._held:
+            _LOGGER.debug("ONNAIS %s: held connection dropped", self._ble_device.address)
+            self._held = None
+
     async def _connect(self, connect_attempts: int = CONNECT_ATTEMPTS) -> BleakClient:
-        client = await establish_connection(
-            BleakClientWithServiceCache,
-            self._latest_ble_device(),
-            self._ble_device.address,
-            max_attempts=connect_attempts,
-            ble_device_callback=self._latest_ble_device,
-            use_services_cache=False,
-        )
+        # Only connection *establishment* needs the shared radio; GATT traffic
+        # on links that are already up can run concurrently.
+        async with _RADIO_LOCK:
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                self._latest_ble_device(),
+                self._ble_device.address,
+                disconnected_callback=self._on_disconnected,
+                max_attempts=connect_attempts,
+                ble_device_callback=self._latest_ble_device,
+                use_services_cache=False,
+            )
+        self.connects += 1
         try:
             if client.services.get_service(SERVICE_UUID) is None:
                 raise OnnaisCommandError("Expected ONNAIS GATT service not found on this device")
@@ -210,15 +232,29 @@ class OnnaisLockClient:
         """
         connect_attempts = BACKGROUND_CONNECT_ATTEMPTS if background else CONNECT_ATTEMPTS
         attempts = 1 if background else MAX_ATTEMPTS
-        async with self._op_lock, _RADIO_LOCK:
+        async with self._op_lock:
+            # Reuse an already-open, already-authenticated link if we hold one.
+            if self.held_connection:
+                held = self._held
+                try:
+                    async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
+                        return await work(held)
+                except TRANSIENT_ERRORS as error:
+                    _LOGGER.debug("ONNAIS %s: held connection failed, reconnecting: %s", self._ble_device.address, error)
+                    self._held = None
+                    await self._safe_disconnect(held)
+
             last_error: Exception | None = None
             for attempt in range(1, attempts + 1):
                 client: BleakClient | None = None
+                keep = False
                 try:
                     async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
                         client = await self._connect(connect_attempts)
                         await self._authenticate(client, self._secret)
-                        return await work(client)
+                        result = await work(client)
+                    keep = self.persistent
+                    return result
                 except (BleakNotFoundError, BleakOutOfConnectionSlotsError) as error:
                     raise OnnaisCommandError(f"Lock not currently reachable: {error}") from error
                 except TRANSIENT_ERRORS as error:
@@ -229,10 +265,20 @@ class OnnaisLockClient:
                     )
                 finally:
                     if client is not None:
-                        await self._safe_disconnect(client)
+                        if keep and client.is_connected:
+                            self._held = client
+                        else:
+                            await self._safe_disconnect(client)
             raise OnnaisCommandError(
                 f"Lock unreachable after {attempts} attempt(s): {last_error}"
             ) from last_error
+
+    async def async_close(self) -> None:
+        """Drop any held connection (on unload / when polling is turned off)."""
+        self.persistent = False
+        held, self._held = self._held, None
+        if held is not None:
+            await self._safe_disconnect(held)
 
     async def _command(self, kind: int, action: int, payload: bytes, accept, what: str) -> dict | None:
         """Send one write command, then read status over the SAME connection.
@@ -310,7 +356,7 @@ class OnnaisLockClient:
         returning. Raises OnnaisAuthError if the lock is already bound to a
         different secret (e.g. still paired with the official app)."""
         probe = OnnaisLockClient(ble_device, old_secret)
-        async with _RADIO_LOCK, asyncio.timeout(PER_ATTEMPT_TIMEOUT):
+        async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
             client = await probe._connect()
             try:
                 await probe._authenticate(client, old_secret)

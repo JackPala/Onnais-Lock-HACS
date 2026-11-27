@@ -12,7 +12,9 @@ from homeassistant.helpers import entity_registry as er
 from .const import (
     ATTR_PASSCODE,
     ATTR_SLOT,
+    CONF_POLL_INTERVAL,
     CONF_SECRET,
+    DEFAULT_POLL_INTERVAL,
     DOMAIN,
     SERVICE_BEGIN_ADD_KEY_FOB,
     SERVICE_CANCEL_OPERATION,
@@ -29,7 +31,8 @@ PLATFORMS = ["lock", "sensor", "switch"]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     secret = bytes.fromhex(entry.data[CONF_SECRET])
-    coordinator = OnnaisCoordinator(hass, entry, entry.data["address"], secret)
+    poll_interval = int(entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+    coordinator = OnnaisCoordinator(hass, entry, entry.data["address"], secret, poll_interval)
     # Initial status read runs in the background: it can take tens of
     # seconds on this link (or fail), and must neither block Home
     # Assistant's startup nor fail setup (ConfigEntryNotReady would make HA
@@ -42,13 +45,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _register_services(hass)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            await coordinator.client.async_close()
     return unloaded
 
 

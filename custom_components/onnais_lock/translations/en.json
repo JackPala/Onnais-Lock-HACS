@@ -60,5 +60,19 @@
       "name": "Unbind (factory reset owner secret)",
       "description": "Destructive. Resets the lock's owner secret back to the vendor default."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ONNAIS lock options",
+        "description": "Polling interval: how often Home Assistant reads this lock's state, in seconds. 0 (default) means no routine polling: state is read at startup and after every command made through Home Assistant, so changes made with the keypad, key or fob won't show until then. With polling on, Home Assistant keeps one Bluetooth connection to the lock open and polls over it silently; the lock chirps only when that connection is opened or re-opened. Uses more lock battery. Minimum 30 seconds.",
+        "data": {
+          "poll_interval": "Polling interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "interval_too_short": "Use 0 to disable polling, or at least 30 seconds."
+    }
   }
 }

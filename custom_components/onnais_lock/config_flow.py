@@ -22,11 +22,21 @@ import secrets
 
 import voluptuous as vol
 from homeassistant.components import bluetooth
-from homeassistant.config_entries import ConfigFlow
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
+from homeassistant.helpers import selector
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import CONF_SECRET, DOMAIN, FACTORY_DEFAULT_SECRET, MANUFACTURER_ID
+from .const import (
+    CONF_POLL_INTERVAL,
+    CONF_SECRET,
+    DEFAULT_POLL_INTERVAL,
+    DOMAIN,
+    FACTORY_DEFAULT_SECRET,
+    MANUFACTURER_ID,
+    MAX_POLL_INTERVAL,
+    MIN_POLL_INTERVAL,
+)
 from .lock_api import OnnaisAuthError, OnnaisLockClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +65,11 @@ def _is_onnais_advertisement(info: bluetooth.BluetoothServiceInfoBleak) -> bool:
 
 class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return OnnaisOptionsFlow()
 
     def __init__(self) -> None:
         self._discovery_info: bluetooth.BluetoothServiceInfoBleak | None = None
@@ -235,4 +250,36 @@ class OnnaisConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title=self._discovery_info.name or address,
             data={"address": address, CONF_SECRET: secret.hex()},
+        )
+
+
+class OnnaisOptionsFlow(OptionsFlow):
+    """Per-lock options: polling interval (0 = no routine polling)."""
+
+    async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            interval = int(user_input[CONF_POLL_INTERVAL])
+            if 0 < interval < MIN_POLL_INTERVAL:
+                errors[CONF_POLL_INTERVAL] = "interval_too_short"
+            else:
+                return self.async_create_entry(data={CONF_POLL_INTERVAL: interval})
+
+        current = int(self.config_entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_POLL_INTERVAL, default=current): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=MAX_POLL_INTERVAL,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                            unit_of_measurement="s",
+                        )
+                    ),
+                }
+            ),
+            errors=errors,
         )
