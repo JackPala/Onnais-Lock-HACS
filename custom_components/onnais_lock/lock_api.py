@@ -118,11 +118,16 @@ class OnnaisLockClient:
 
     def __init__(
         self,
-        ble_device: BLEDevice,
+        ble_device: BLEDevice | None,
         secret: bytes,
         ble_device_callback: Callable[[], BLEDevice | None] | None = None,
+        address: str | None = None,
     ):
+        # ble_device may be None when the lock hasn't been heard yet (sparse
+        # advertiser, e.g. right after a Home Assistant restart); it's
+        # resolved through ble_device_callback on each connect attempt.
         self._ble_device = ble_device
+        self._address = address or ble_device.address
         self._secret = bytes(secret)
         self._ble_device_callback = ble_device_callback
         self._stream = FrameStream()
@@ -155,6 +160,10 @@ class OnnaisLockClient:
             device = self._ble_device_callback()
             if device is not None:
                 self._ble_device = device
+        if self._ble_device is None:
+            raise OnnaisCommandError(
+                f"Lock {self._address} not currently visible to Home Assistant's Bluetooth stack"
+            )
         return self._ble_device
 
     def _on_notify(self, _characteristic, data: bytearray) -> None:
@@ -173,7 +182,7 @@ class OnnaisLockClient:
 
     def _on_disconnected(self, client: BleakClient) -> None:
         if client is self._held:
-            _LOGGER.debug("ONNAIS %s: held connection dropped", self._ble_device.address)
+            _LOGGER.debug("ONNAIS %s: held connection dropped", self._address)
             self._held = None
 
     async def _connect(self, connect_attempts: int = CONNECT_ATTEMPTS) -> BleakClient:
@@ -183,7 +192,7 @@ class OnnaisLockClient:
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self._latest_ble_device(),
-                self._ble_device.address,
+                self._address,
                 disconnected_callback=self._on_disconnected,
                 max_attempts=connect_attempts,
                 ble_device_callback=self._latest_ble_device,
@@ -206,7 +215,7 @@ class OnnaisLockClient:
             async with asyncio.timeout(DISCONNECT_TIMEOUT):
                 await client.disconnect()
         except Exception as error:  # noqa: BLE001 - best-effort cleanup only
-            _LOGGER.debug("ONNAIS %s: disconnect failed/timed out: %s", self._ble_device.address, error)
+            _LOGGER.debug("ONNAIS %s: disconnect failed/timed out: %s", self._address, error)
 
     async def _authenticate(self, client: BleakClient, secret: bytes) -> None:
         result = await self._request(client, 1, 2, bytes([len(secret)]) + secret)
@@ -240,7 +249,7 @@ class OnnaisLockClient:
                     async with asyncio.timeout(PER_ATTEMPT_TIMEOUT):
                         return await work(held)
                 except TRANSIENT_ERRORS as error:
-                    _LOGGER.debug("ONNAIS %s: held connection failed, reconnecting: %s", self._ble_device.address, error)
+                    _LOGGER.debug("ONNAIS %s: held connection failed, reconnecting: %s", self._address, error)
                     self._held = None
                     await self._safe_disconnect(held)
 
@@ -261,7 +270,7 @@ class OnnaisLockClient:
                     last_error = error
                     _LOGGER.debug(
                         "ONNAIS %s: attempt %d/%d failed: %s",
-                        self._ble_device.address, attempt, attempts, error,
+                        self._address, attempt, attempts, error,
                     )
                 finally:
                     if client is not None:
@@ -297,7 +306,7 @@ class OnnaisLockClient:
             try:
                 return await self._read_status(client)
             except TRANSIENT_ERRORS as error:
-                _LOGGER.debug("ONNAIS %s: status read after %s failed: %s", self._ble_device.address, what, error)
+                _LOGGER.debug("ONNAIS %s: status read after %s failed: %s", self._address, what, error)
                 return None
         return await self.run(work)
 

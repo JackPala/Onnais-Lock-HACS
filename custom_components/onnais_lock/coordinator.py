@@ -8,7 +8,7 @@ from datetime import timedelta
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .lock_api import OnnaisAuthError, OnnaisCommandError, OnnaisLockClient
@@ -49,10 +49,12 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
         self.entry = entry
         self._force_refresh = True
         self._command_pending = False
-        ble_device = self._lookup_ble_device()
-        if ble_device is None:
-            raise ConfigEntryNotReady(f"ONNAIS lock {address} not currently visible to Home Assistant's Bluetooth stack")
-        self.client = OnnaisLockClient(ble_device, secret, ble_device_callback=self._lookup_ble_device)
+        # Don't fail setup if the lock hasn't been heard yet (it advertises
+        # sparsely): that left entities unavailable in setup_retry. The
+        # device is looked up on every connect attempt instead.
+        self.client = OnnaisLockClient(
+            self._lookup_ble_device(), secret, ble_device_callback=self._lookup_ble_device, address=address
+        )
         # Polling: hold the connection open between polls (one chirp per
         # connect, not per poll) -- the vendor app's own connection model.
         self.client.persistent = poll_interval > 0
