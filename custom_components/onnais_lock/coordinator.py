@@ -59,6 +59,24 @@ class OnnaisCoordinator(DataUpdateCoordinator[dict]):
         # connect, not per poll) -- the vendor app's own connection model.
         self.client.persistent = poll_interval > 0
 
+    async def async_set_poll_interval(self, poll_interval: int) -> None:
+        """Change the polling interval without reloading the entry."""
+        if poll_interval == self.poll_interval:
+            return
+        self.poll_interval = poll_interval
+        self.update_interval = timedelta(seconds=poll_interval) if poll_interval > 0 else HEALTH_CHECK_INTERVAL
+        self.client.persistent = poll_interval > 0
+        if poll_interval == 0:
+            await self.client.async_close()
+        # Re-arm the timer on the new interval. With polling on this also does
+        # the first read (opening the held connection); with it off the
+        # healthy-state gate makes it a no-op. Run it in the background so the
+        # settings change returns immediately.
+        self.entry.async_create_background_task(
+            self.hass, self.async_refresh(), name=f"onnais_lock poll interval {self.address}"
+        )
+        self.async_update_listeners()
+
     def _lookup_ble_device(self):
         return bluetooth.async_ble_device_from_address(self.hass, self.address, connectable=True)
 

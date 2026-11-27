@@ -26,7 +26,7 @@ from .const import (
 )
 from .coordinator import OnnaisCoordinator
 
-PLATFORMS = ["lock", "sensor", "switch"]
+PLATFORMS = ["lock", "number", "sensor", "switch"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -50,7 +50,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    await hass.config_entries.async_reload(entry.entry_id)
+    # Apply a polling-interval change live instead of reloading the entry:
+    # a reload drops and re-opens the Bluetooth link (an extra chirp).
+    coordinator: OnnaisCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
+        await hass.config_entries.async_reload(entry.entry_id)
+        return
+    await coordinator.async_set_poll_interval(
+        int(entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

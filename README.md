@@ -21,6 +21,7 @@ or internet connection needed for day-to-day use.
 | `sensor.<name>_programmed_codes` | Sensor | Count and slot numbers of programmed passcodes, fingerprints, and key fobs |
 | `switch.<name>_buzzer` | Switch | Audible beep on/off |
 | `switch.<name>_keypad_light` | Switch | Keypad backlight on/off |
+| `number.<name>_polling_interval` | Number | Seconds between status reads (0 = off) |
 
 Plus services: `set_temp_password`, `delete_temp_password`,
 `delete_fingerprint`, `begin_add_key_fob`, `delete_key_fob`,
@@ -57,7 +58,9 @@ instead, importing it without repeating pairing mode.
 
 ### Polling interval (optional)
 
-**Settings → Devices & services → ONNAIS RV Lock → Configure** (per lock).
+Set it per lock with the **Polling interval** entity in the lock's device page
+(**Configuration** card), or under **Settings → Devices & services → ONNAIS RV
+Lock → Configure**. Changes apply immediately.
 
 - **0 (default):** no routine polling. State is read at startup and after
   every command sent through Home Assistant, and retried in the background
